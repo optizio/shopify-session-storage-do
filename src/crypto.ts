@@ -113,6 +113,7 @@ async function importKeyring(keys: Uint8Array<ArrayBuffer>[]): Promise<Keyring> 
 
   const keyring: Keyring = {
     currentKid: current.kid,
+    kids: entries.map((entry) => entry.kid),
 
     async seal(plaintext: string, aad: string): Promise<Sealed> {
       // Guards against sealing the string 'undefined' as if it were a token.
@@ -162,16 +163,19 @@ async function importEntry(raw: Uint8Array<ArrayBuffer>, current: boolean): Prom
 // to equal its own canonical re-encoding makes the decode strict.
 function decodeStrict(entry: string): Uint8Array<ArrayBuffer> | undefined {
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(entry)) return undefined
+  const bytes = base64Bytes(entry)
+  return bytes && btoa(String.fromCharCode(...bytes)) === entry ? bytes : undefined
+}
+
+/** Forgiving standard base64 (as `atob`); `undefined` when `atob` refuses it. */
+export function base64Bytes(text: string): Uint8Array<ArrayBuffer> | undefined {
   let binary: string
   try {
-    binary = atob(entry)
+    binary = atob(text)
   } catch {
     return undefined
   }
-  if (btoa(binary) !== entry) return undefined
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  return bytes
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0))
 }
 
 function isSealed(value: unknown): value is Sealed {

@@ -518,6 +518,22 @@ describe('loadOfflineSession', () => {
     expect(tagOf(session)).toMatchObject({ value: { tokenFp: 'fp-app' }, enumerable: false })
   })
 
+  it('passes an app token through as source app_token, tagged so reportUnauthorized can drop it', async () => {
+    const { storage, calls } = storageFor({
+      getSession: () => ({ ...ok({}, 'fp-app-token'), source: 'app_token' }),
+      reportUnauthorized: () => ({ status: 'marked' }),
+    })
+    const result = await storage.loadOfflineSession(SHOP)
+    expect(result).toMatchObject({ status: 'ok', source: 'app_token' })
+    await storage.reportUnauthorized((result as { session: Session }).session)
+    expect(calls[1]).toMatchObject({ method: 'reportUnauthorized', input: { shop: SHOP, tokenFp: 'fp-app-token' } })
+  })
+
+  it('leaves source off a chain token', async () => {
+    const { storage } = storageFor({ getSession: () => ok() })
+    expect(await storage.loadOfflineSession(SHOP)).not.toHaveProperty('source')
+  })
+
   it('forwards minValidityMs and canonicalises the shop', async () => {
     const { storage, calls } = storageFor({ getSession: () => ok() })
     await storage.loadOfflineSession(' Cool-Shop.myshopify.com ', { minValidityMs: 20 * 60 * 1000 })
@@ -648,7 +664,15 @@ describe('deleteShop', () => {
 
 describe('describe', () => {
   it('passes the object’s status through', async () => {
-    const status: ShopSessionStatus = { shop: SHOP, exists: true, state: 'ok', source: 'refresh', nextAlarmAt: null }
+    const status: ShopSessionStatus = {
+      shop: SHOP,
+      exists: true,
+      state: 'ok',
+      source: 'refresh',
+      nextAlarmAt: null,
+      keyring: { kids: ['kid-a'] },
+      credentials: { credFp: 'fp' },
+    }
     const { storage, calls } = storageFor({ describe: () => status })
     expect(await storage.describe('COOL-SHOP.myshopify.com')).toEqual(status)
     expect(calls[0]).toMatchObject({ shop: SHOP, method: 'describe', input: { shop: SHOP } })

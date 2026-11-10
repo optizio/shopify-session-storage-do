@@ -58,6 +58,10 @@ it in a private repository and share it here for anyone it helps; see
   callers of the adapter.
 - **Nothing secret is logged or reported:** no tokens, refresh tokens, client
   secret, response bodies or request data.
+- **The app token key, if you configure one, reaches every shop.** Whoever
+  holds it can get a token for every store that installed the app, with no
+  refresh token needed. Leaving `appTokenKey` unset keeps it out of the
+  picture; see [App-token fallback](#app-token-fallback).
 
 Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
@@ -86,11 +90,12 @@ Requirements:
   than errors, so it doesn't rely on newer runtime behaviour. It is tested at
   `2024-09-23` and a current date (RPC needs `2024-04-03` or later).
 
-There are no runtime dependencies. The package has two entry points: `.` (the
-storage adapter, the backfill, `validateKeyring` and types) never imports
-`cloudflare:workers`, so `shopify.server.ts` and Node tests can load it;
-`./durable-object` holds the Durable Object and is imported only by the Worker
-entry.
+There are no runtime dependencies. The package has three entry points. `.`
+(the storage adapter, the backfill, `validateKeyring` and types) never imports
+`cloudflare:workers`, so `shopify.server.ts` and Node tests can load it.
+`./durable-object` holds the Durable Object, and `./workflow` holds the optional
+[rotation Workflow](#rotating-secrets-with-a-workflow); only the Worker entry
+imports them.
 
 ## Usage
 
@@ -259,6 +264,11 @@ switch (result.status) {
 }
 ```
 
+With the [app-token fallback](#app-token-fallback) on, `ok` can also carry
+`source: 'app_token'`: an application-only token, served while the shop's own
+chain can't produce one. It is used the same way, including
+`reportUnauthorized` on a 401.
+
 - **`minValidityMs`** is how long the token must stay valid; the object clamps
   it to 6–40 minutes (default 6) and refreshes first when needed, making the
   caller wait at most 3 s. Reload between batches for longer jobs.
@@ -271,6 +281,90 @@ switch (result.status) {
   `Symbol.for('@optizio/shopify-session-storage-do')` holding the token's
   fingerprint. It lets the object tell a write-back (a scope update, a 401) from
   a new exchange, and nothing persists it.
+
+### App-token fallback
+
+Optional. When the shop's refresh-token chain can't produce a token (Shopify
+rejected it, an emergency secret revocation, the token endpoint down with no
+token left), `loadOfflineSession` answers with an
+[application-only access token][app-only] instead, so webhooks and jobs keep
+running until the merchant opens the app again. It is minted with a JWT signed
+by your own key, not the client secret, so a revoked secret doesn't stop it.
+
+- Only `loadOfflineSession` gets it. `loadSession` (the library) still sees
+  `needs_reauth` or `tokenless`, so `authenticate.admin` exchanges and heals
+  the chain. A webhook handler's `admin` client comes from `loadSession`, so
+  it doesn't fall back; handlers that should keep working load the token with
+  `loadOfflineSession` instead.
+- It never replaces or resets the chain, even when app code writes it (or an
+  earlier one) back through `storeSession`. It is stored next to the chain,
+  sealed like every token, and reused until it has less than `minValidityMs`
+  left (a token that never lived that long: for the first half of its life).
+  The next exchange or refresh drops it, as do a 401 (`reportUnauthorized`, or
+  the library's own write-back, after which minting waits a minute), a new
+  signing key, and delete.
+- One mint at a time per shop. Mints never hold up refreshes, and a load
+  still waits at most 3 s for token calls in all. A failed mint answers as the
+  chain would: after a transient failure the object waits a minute (or
+  `Retry-After`); after a rejection (a bad or revoked key, an uninstalled
+  shop) it stops for 10 minutes, then longer while it repeats (up to a day),
+  or until the key or the chain changes.
+- Never for a shop without a record: nothing is minted for unknown domains.
+- Shopify allows it for apps with public distribution on stores that
+  installed them.
+
+Setup:
+
+```sh
+# An ES256 key pair (RS256 with 2048–8192 bits works too).
+openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out app-token-key.pem
+# The public JWK to add in the Dev Dashboard (Settings > Credentials > Public keys).
+node -e "const k=require('crypto').createPublicKey(require('fs').readFileSync('app-token-key.pem')).export({format:'jwk'});console.log(JSON.stringify({...k,kid:'app-key-1',alg:'ES256',use:'sig'}))"
+wrangler secret put SHOPIFY_APP_TOKEN_KEY < app-token-key.pem   # per env; escrow it like the keyring
+```
+
+```ts
+export const ShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.SESSION }),
+  appTokenKey: (env) =>
+    env.SHOPIFY_APP_TOKEN_KEY ? { kid: 'app-key-1', alg: 'ES256', privateKey: env.SHOPIFY_APP_TOKEN_KEY } : undefined,
+})
+```
+
+A malformed key, or an `appTokenKey(env)` that throws, is reported
+(`app_token_key`, at most hourly per isolate) and turns the fallback off; the
+chain carries on. To rotate the key, add the new public JWK (Shopify allows two), deploy
+the new `kid`, wait an hour for tokens minted under the old one to expire, then
+revoke the old key. If the private key leaks, revoke it in the Dev Dashboard:
+that ends every token minted with it.
+
+### App-token primary mode
+
+To replace offline refresh tokens entirely with [application-only access
+tokens][app-only], set `appTokenMode: 'primary'` alongside `appTokenKey`. Each
+shop's Durable Object becomes a read-through cache with a 3–8 minute pre-expiry
+renew window (`renewAfter`), single-flight minting, and transient retries. The
+client secret is optional in this mode. Legacy refresh-token rows are ignored
+and overwritten on the next `loadSession`.
+
+```ts
+export const ShopSessions = createShopSessionsDurableObject<Env>({
+  registry: (env) => ({ kv: env.SESSION }),
+  appTokenMode: 'primary',
+  appTokenKey: (env) => ({ kid: 'app-key-1', alg: 'ES256', privateKey: env.SHOPIFY_APP_TOKEN_KEY }),
+  // apiSecretKey optional here (still useful for webhook HMAC / online tokens in the app).
+})
+```
+
+After an Admin API `401`, call `sessionStorage.invalidateAndRefresh(shop, tokenUsed)`
+once and replay the request on `refreshed` or `ignored_stale` (another request
+already replaced the token); on `failed`, don't replay. A shop with no record
+(uninstalled, never installed) is never minted for: `loadOfflineSession`
+answers `none`. `rollover` remints the cache, so the rotation Workflow works
+in this mode too. Set `strictSigningKid: true` to remint immediately
+when you deploy a new signing `kid`. See DESIGN.md §6.11.
+
+[app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
 ### What the library sees
 
@@ -305,22 +399,26 @@ Returns a class (`new (ctx, env)`, extending `DurableObject`) to export from
 the Worker entry. Every option that takes `env` is read from the host Worker's
 bindings, since a Durable Object receives nothing else.
 
-| Option                   | Default                               | Notes                                                                                        |
-| ------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'` |
-| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                            |
-| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty                                                                            |
-| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                 |
-| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off   |
-| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                          |
-| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                    |
-| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                 |
-| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                            |
-| `fetch`, `now`           | globals                               | for tests                                                                                    |
+| Option                   | Default                               | Notes                                                                                                                                 |
+| ------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `registry(env)`          | required                              | `{ kv, prefix? }`: KV namespace for registry markers; `prefix` defaults to `'shop-session:'`                                          |
+| `apiKey(env)`            | `env.SHOPIFY_API_KEY`                 | throws when empty                                                                                                                     |
+| `apiSecretKey(env)`      | `env.SHOPIFY_API_SECRET`              | throws when empty (optional when `appTokenMode` is `primary`)                                                                         |
+| `encryptionKeys(env)`    | `env.SHOPIFY_SESSION_ENCRYPTION_KEYS` | malformed: every call throws                                                                                                          |
+| `legacyKv(env)`          | none                                  | KV holding `offline_<shop>` sessions from `KVSessionStorage`; `undefined` turns import off                                            |
+| `migrateLegacy(env)`     | `false`                               | upgrade legacy tokens; read each time an alarm runs                                                                                   |
+| `legacyCutoff`           | `Date.UTC(2027, 0, 1)`                | from then on legacy tokens aren't served and legacy exchanges are ignored                                                             |
+| `appTokenKey(env)`       | none                                  | `{ kid, alg: 'ES256' \| 'RS256', privateKey }` (PKCS#8 PEM or private JWK); see [App-token fallback](#app-token-fallback)             |
+| `appTokenMode`           | `'fallback'`                          | `'primary'` makes offline sessions an app-token cache; requires `appTokenKey` (see [App-token primary mode](#app-token-primary-mode)) |
+| `strictSigningKid`       | `false`                               | primary mode: remint when the cached `signingKid` differs from the configured key                                                     |
+| `allowMyshopifyIo`       | `false`                               | accept `*.myshopify.io`; must match the adapter and backfill                                                                          |
+| `report(error, context)` | none                                  | receives a `ShopSessionError`; the log line is written either way                                                                     |
+| `fetch`, `now`           | globals                               | for tests                                                                                                                             |
 
 The object's RPC methods (`getSession`, `putSession`, `reportUnauthorized`,
-`destroy`, `importLegacy`, `describe`) take a canonical `shop` that must match
-the object's name. Go through the adapter rather than calling them directly.
+`invalidateAndRefresh`, `destroy`, `importLegacy`, `describe`) take a canonical
+`shop` that must match the object's name. Go through the adapter rather than
+calling them directly.
 
 ### `new DurableObjectSessionStorage(options)`
 
@@ -330,16 +428,17 @@ the object's name. Go through the adapter rather than calling them directly.
 | `locationHint`     | `'enam'` | eastern North America; the first access fixes an object's location, so use one value at every call site |
 | `allowMyshopifyIo` | `false`  | must match the Durable Object                                                                           |
 
-| Method                                         | Does                                                                                           |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `loadSession(id)`, `storeSession(session)`     | the library's interface (offline ids `offline_<shop>` only)                                    |
-| `loadOfflineSession(shop, { minValidityMs? })` | `ok` / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
-| `reportUnauthorized(session)`                  | background 401 on an issued session                                                            |
-| `deleteShop(shop, { uninstalledAt? })`         | `deleted` or `kept_newer_install`                                                              |
-| `rollover(shop, { obtainedBefore })`           | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)              |
-| `describe(shop)`                               | non-secret status, see [Debugging](#debugging-with-describe)                                   |
-| `deleteSession(id)`, `deleteSessions(ids)`     | delete without the reinstall guard                                                             |
-| `findSessionsByShop(shop)`                     | `[session]` when it has an access token, else `[]`                                             |
+| Method                                           | Does                                                                                                                    |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `loadSession(id)`, `storeSession(session)`       | the library's interface (offline ids `offline_<shop>` only)                                                             |
+| `loadOfflineSession(shop, { minValidityMs? })`   | `ok` (`source?: 'app_token'`) / `none` / `needs_reauth` (`since`, `reason`) / `unavailable` (`reason`, `retryAfterMs?`) |
+| `invalidateAndRefresh(shop, failedAccessToken?)` | primary mode: `refreshed` / `ignored_stale` / `failed`; remint after an Admin API 401                                   |
+| `reportUnauthorized(session)`                    | background 401 on an issued session                                                                                     |
+| `deleteShop(shop, { uninstalledAt? })`           | `deleted` or `kept_newer_install`                                                                                       |
+| `rollover(shop, { obtainedBefore })`             | replace the shop's credentials now, see [Rolling over](#rolling-over-credentials)                                       |
+| `describe(shop)`                                 | non-secret status, see [Debugging](#debugging-with-describe)                                                            |
+| `deleteSession(id)`, `deleteSessions(ids)`       | delete without the reinstall guard                                                                                      |
+| `findSessionsByShop(shop)`                       | `[session]` when it has an access token, else `[]`                                                                      |
 
 RPC infrastructure errors marked retryable are retried once with a fresh stub.
 
@@ -389,6 +488,7 @@ Returns `{ status, attempted, outcomes, pass? }`. `status` is `idle`,
 | `SHOPIFY_API_KEY`                 | var    | the app's client id                                              |
 | `SHOPIFY_API_SECRET`              | secret | the app's client secret                                          |
 | `SHOPIFY_SESSION_ENCRYPTION_KEYS` | secret | comma-separated base64 keys of 32 bytes, distinct, current first |
+| `SHOPIFY_APP_TOKEN_KEY`           | secret | optional; any name, read by your `appTokenKey(env)`              |
 
 ## Operations
 
@@ -421,6 +521,9 @@ material.
 4. **Keep old keys for at least 90 days.** `describe(shop).kids` lists the keys
    a record still uses; describe the shops in the registry before removing
    one.
+
+The [rotation Workflow](#rotating-secrets-with-a-workflow) runs these steps,
+including the 90-day wait and the check before the drop.
 
 A record sealed under a removed key is not deleted: it answers `tokenless` to
 the library (the next admin request exchanges and replaces it) and
@@ -502,19 +605,99 @@ When to run one:
   secret when it refreshes. Revoke the old secret only once `unrolled` is
   empty. The app must accept webhooks signed with either secret meanwhile
   (Shopify signs with the oldest unrevoked one), which the package doesn't
-  cover.
+  cover. The [rotation Workflow](#rotating-secrets-with-a-workflow) runs this
+  with stages and approvals.
 - **Leaked storage or refresh tokens:** two passes, the second with an
   `obtainedBefore` after the first finished. Shopify keeps a presented refresh
   token usable until its replacement is presented, so only the second pass
   retires the leaked ones. Leaked access tokens live out their hour.
 - **After rotating the keyring:** one pass reseals every live shop.
-- **After an emergency revoke:** whether refresh tokens issued under the old
-  secret still work with the new one is unverified. If they do, a pass brings
-  background work back for every shop; if not, shops recover as merchants open
-  the app.
+- **After an emergency revoke:** refresh tokens issued under the old secret
+  still refresh with the new one (rehearsed on a dev store), so a pass brings
+  background work back for every shop at once instead of waiting for each
+  shop's alarm.
 
 `rollover(shop, { obtainedBefore })` on the storage does the same for one shop
 and returns its answer.
+
+### Rotating secrets with a Workflow
+
+`createRotateSecretsWorkflow` (from `./workflow`) runs the two rotations above
+(the keyring and the Shopify client secret) as one durable, gated
+[Cloudflare Workflow](https://developers.cloudflare.com/workflows/). Operators
+still put the secrets. The Workflow checks each deploy against a snapshot it
+took before, runs the rollover passes under its own KV keys, and waits for an
+explicit event before every irreversible step. It holds no secret, and no step
+output or event carries one. The design is in `spec.secret-rotation.md`.
+
+```ts
+// Worker entry
+import { createRotateSecretsWorkflow } from '@optizio/shopify-session-storage-do/workflow'
+
+export const RotateSecrets = createRotateSecretsWorkflow<Env>({
+  registry: (env) => ({ kv: env.SESSION }), // the Durable Object's registry
+  namespace: (env) => env.SHOP_SESSIONS,
+  legacyKv: (env) => env.SESSION, // while legacy `offline_*` sessions may remain; leave out otherwise
+})
+```
+
+```toml
+# Workflow names are global per account, and bindings aren't inherited: one per environment.
+[env.production]
+workflows = [{ name = "rotate-secrets-production", binding = "ROTATE_SECRETS", class_name = "RotateSecrets" }]
+```
+
+It needs Workers Paid. On the Free plan, a Workflow step gets 10 ms of CPU and an
+instance 1,024 steps, and a rollover run needs more. At most 5 stages are
+allowed, which keeps a rotation near 3,000 of the 10,000 steps an instance gets.
+
+Start a rotation with `env.ROTATE_SECRETS.create({ params: { kind, canaryShop } })`,
+and send each event from an authenticated operator route with
+`(await env.ROTATE_SECRETS.get(id)).sendEvent({ type, payload: {} })`. The
+canary must be a live, non-legacy shop (`describe` answers `state: 'ok'`).
+`wrangler workflows instances describe` shows each step's output, including the
+stragglers.
+
+**Keyring** (`kind: 'keyring'`):
+
+1. Generate and escrow the key, put `new,old` in one `wrangler secret put`,
+   then send `keyring-deployed`. The Workflow checks that the live kids are
+   exactly the new one followed by the old ones, and that the canary reseals.
+2. After 90 days it describes every registry shop, rolls the live ones still on
+   an old key, and lists the rest (legacy, quarantined, unreadable). Then it
+   checks that the keyring hasn't changed since and waits for `approve-drop`.
+3. Put the keyring without the old keys, then send `keyring-dropped`. The
+   Workflow checks the drop and finishes with
+   `{ newKid, dropKids, stragglers }`.
+
+**Client secret** (`kind: 'api-secret'`, optional `stages`, default `[10, 200]`):
+
+1. Before anything else, deploy the app so that it accepts webhooks and session
+   tokens signed with either secret (`SHOPIFY_API_SECRET_PREVIOUS`). Shopify
+   signs webhooks with the oldest unrevoked secret; the package doesn't
+   verify them.
+2. Generate the new secret in the Dev Dashboard, then run **one**
+   `wrangler secret bulk` with `SHOPIFY_API_SECRET=new` and
+   `SHOPIFY_API_SECRET_PREVIOUS=old`. Two `secret put` commands would deploy
+   twice. Send `api-secret-deployed`. The Workflow checks that the live
+   credentials changed and that the canary refreshes with them.
+3. It waits 10 minutes, so that refreshes cut off by the deploy replay first,
+   then runs a rollover pass per stage. After each stage `n` it waits for
+   `approve-after-n`, then runs a full pass. A halted pass waits for
+   `resume-stage-n` (or `resume-stage-all`).
+4. If shops didn't roll, or legacy `offline_*` sessions remain, it waits for
+   `ack-stragglers`. Revoking kills those shops' access tokens. Expiring-token
+   shops recover on their next refresh, because refresh tokens survive the
+   revoke; legacy shops don't.
+5. Revoke the old secret in the Dev Dashboard and send `api-secret-revoked`.
+   The Workflow checks that the canary still refreshes. Then remove
+   `SHOPIFY_API_SECRET_PREVIOUS`.
+
+Each wait has a timeout (7 to 30 days), and a timed-out or failed instance
+stops. `keyringRetention: (env) => '2 minutes'` shortens the keyring flow's
+90-day wait, for a rehearsal on a staging Worker only (`scripts/staging`). One rotation per kind runs at a time, under
+`shop-sessions:rotation:<kind>:lock` in the registry KV. A failed instance
+keeps its lock, so delete the lock by hand after investigating.
 
 ### Listing shops
 
@@ -532,8 +715,11 @@ its token works; KV listings are eventually consistent.
 token and refresh-token expiry, `pairObtainedAt`, `tokenInvalid`,
 `attemptPending` (a token call was sent and its outcome isn't stored yet), the
 number of alternates, `kids`, `needsReauth`, `failures` (count, kind, code,
-since, retryAt, ambiguous) and `nextAlarmAt`. Expose it only through an authenticated
-operator route.
+since, retryAt, ambiguous) and `nextAlarmAt`. It also reports the object's live
+configuration: `keyring.kids` (the deployed keyring's kids, current first) and
+`credentials.credFp` (a truncated SHA-256 of the API key and secret). Neither is
+secret. Both show what a deploy changed, which the rotation Workflow checks.
+Expose `describe` only through an authenticated operator route.
 
 ### Quarantine and failures
 
@@ -583,6 +769,8 @@ use.
 - [ ] Nothing persists an access token (job rows, queue messages): pass the
       shop and load the token when the work runs.
 - [ ] Background 401s call `reportUnauthorized`.
+- [ ] With `appTokenKey`: the public JWK is registered in the Dev Dashboard for
+      the `kid` deployed, and the private key is a secret, escrowed.
 - [ ] Webhooks that write sessions, such as `APP_SCOPES_UPDATE`, call
       `shopify.sessionStorage.storeSession`, not a new `KVSessionStorage`
       (which would write the token back to KV in plaintext).
@@ -604,7 +792,9 @@ use.
 - **One client secret at a time.** The object always uses
   `SHOPIFY_API_SECRET`; a planned rotation is a deploy followed by a
   [rollover](#rolling-over-credentials). Accepting webhooks and session tokens
-  signed with either secret during the overlap is up to the app.
+  signed with either secret during the overlap is up to the app. Shops whose
+  rollover is rejected keep background work running on the
+  [app-token fallback](#app-token-fallback), if configured.
 - **Some fleet sweeps are deferred:** re-counting or re-placing every object,
   and a circuit breaker for the backfill. None needs a change to stored data.
 - **No caching in the isolate.** Every load is an RPC to the shop's object.

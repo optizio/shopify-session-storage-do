@@ -28,6 +28,8 @@ Goals
 - Tokens are encrypted at rest (AES-256-GCM, rotatable keyring). An unreadable
   record degrades to a token exchange, not an outage.
 - A registry of installed shops (KV markers) for fleet listing.
+- Optionally, an application-only token for app callers while the chain can't
+  produce one (§6.10).
 
 Non-goals (v1)
 - Online sessions (`storeSession` of one throws; `loadSession` of an online id
@@ -63,9 +65,13 @@ Shopify
   (≤ 30 days after first use, ≤ its expiry); retrying it returns the same pair.
 - Any exchange retires every other refresh token for the shop; a DO refresh that
   succeeds was therefore processed before any exchange it overlaps with.
-- Terminal: refresh `401 invalid_request`; migration `400 invalid_subject_token`
-  / `invalid_requested_token_type`. Transient: network, timeout, `5xx`, `429`,
-  challenge pages. Shop state: `402`, `423`, `404`. Other `4xx`/`3xx`:
+- Terminal: refresh `401 invalid_grant` ("This request requires an active
+  refresh_token", for a retired or unknown token; `401 invalid_request` is
+  also accepted); migration `400 invalid_subject_token` /
+  `invalid_requested_token_type`. A wrong client secret answers `400
+  invalid_request`, an unknown client id `400 application_cannot_be_found`,
+  so a `401` never means configuration. Transient: network, timeout, `5xx`,
+  `429`, challenge pages. Shop state: `402`, `423`, `404`. Other `4xx`/`3xx`:
   configuration.
 - Migration invalidates the legacy token at once; the identical request within
   7 days returns the same pair. Responses may omit `scope`.
@@ -76,10 +82,30 @@ Shopify
   revoked; a refresh sent with the new secret pins the shop's token to it;
   webhooks are signed with the oldest unrevoked secret. The Dev Dashboard's
   rotation refresh token re-pins legacy tokens only and needs the current
-  token. Revoking a secret kills the access tokens pinned to it; whether
-  refresh tokens issued under it still refresh with the new secret is
-  undocumented (to be found by rehearsal). Shopify publishes no rate limit or
-  pacing for the token endpoint.
+  token. Revoking a secret kills the access tokens pinned to it, but refresh
+  tokens issued under it still refresh with the new secret, so every chain
+  recovers on its next refresh. Replaying a presented refresh token with the
+  other secret returns the same pair, still pinned to the secret it was first
+  sent with. Shopify publishes no rate limit or pacing for the token endpoint.
+- Application-only tokens ([docs][app-only]): `client_credentials` with a JWT
+  `client_assertion` (ES256 or RS256; `iss` = `sub` = client id, `aud` the
+  shop's token URL, `exp` ≤ 300 s after `iat`, each `jti` accepted once per
+  app), form-encoded, no client secret. Public-distribution apps only, on
+  stores that installed them. The token lasts ≤ 1 h, has no refresh token,
+  carries every granted scope (write scopes imply their read scopes), and a
+  second mint with the same key within the minute returns the same token; each
+  key gets its own. A replayed assertion answers `401 invalid_client`, as does
+  an unregistered or revoked key. Revoking the secret doesn't affect it;
+  revoking its public key (at most two are active) ends it at once, as does an
+  uninstall. Token exchange and refresh accept only the client secret. No
+  documented error codes or rate limit.
+
+Checked against a dev store on 2026-11-10 with `scripts/rehearsal` (its README
+lists each check). Not checked: the exchange retiring other refresh tokens,
+the 30-day and 7-day windows, webhook signing, the 2027 `403`, the rotation
+refresh token, the two-key limit and rate limits.
+
+[app-only]: https://shopify.dev/docs/apps/build/authentication-authorization/application-only-access-tokens
 
 Cloudflare
 - `fetch()` (and, conservatively, `crypto.subtle`) awaits let other events
@@ -98,6 +124,7 @@ Entry points
 - `.` — `DurableObjectSessionStorage`, `migrateLegacySessions`,
   `rolloverShops`, `validateKeyring`, types. **No `cloudflare:workers` import.**
 - `./durable-object` — `createShopSessionsDurableObject`.
+- `./workflow` — `createRotateSecretsWorkflow` (§7.3), `rotationKeys`, types.
 
 Peer `@shopify/shopify-api` `^15.0.0`. No runtime dependencies.
 
@@ -105,12 +132,15 @@ Source
 - `src/shop.ts` canonical shop domains.
 - `src/crypto.ts` keyring, seal/open, fingerprints, credential fingerprint.
 - `src/token-client.ts` Shopify OAuth calls and classification.
+- `src/app-token.ts` client assertions for the application-only grant.
 - `src/core/record.ts` record type, pure merge rules, schedule, backoff.
 - `src/core/shop-sessions.ts` orchestrator (injected storage/alarm/clock/KV/
   token client/crypto; Node-testable).
 - `src/durable-object.ts` DurableObject shell.
 - `src/adapter.ts`, `src/backfill.ts`, `src/rollover.ts`, `src/types.ts`
   (shared contracts).
+- `src/rotation.ts` the rotation flows (§7.3; the step and failure type are
+  injected, so Node-testable); `src/workflow.ts` its Workflow shell.
 
 ## 4. Public API
 
@@ -120,7 +150,7 @@ Source
 new DurableObjectSessionStorage({ namespace, locationHint = 'enam', allowMyshopifyIo = false })
 loadSession(id) / storeSession(session) / deleteSession(id) / deleteSessions(ids) / findSessionsByShop(shop)
 loadOfflineSession(shop, { minValidityMs? }): Promise<
-  | { status: 'ok', session } | { status: 'none' }
+  | { status: 'ok', session, source?: 'app_token' } | { status: 'none' }
   | { status: 'needs_reauth', since: Date, reason }
   | { status: 'unavailable', reason: 'token_endpoint' | 'unreadable' | 'legacy_unusable' | 'import_failed', retryAfterMs? }>
 reportUnauthorized(session): Promise<void>        // background 401 on an issued session
@@ -158,6 +188,9 @@ createShopSessionsDurableObject<Env>({
   encryptionKeys?(env)                                 // default env.SHOPIFY_SESSION_ENCRYPTION_KEYS
   legacyKv?(env): KVNamespace | undefined              // app gates per env, e.g. SHOP_SESSIONS_LEGACY_IMPORT === 'on'
   migrateLegacy?(env): boolean                         // default false; read when the alarm runs
+  appTokenKey?(env): { kid, alg: 'ES256' | 'RS256', privateKey: PEM | JWK } | undefined   // §6.10 / §6.11
+  appTokenMode?: 'fallback' | 'primary' | (env) => ...                                   // §6.11; default fallback
+  strictSigningKid?: boolean | (env) => boolean                                          // §6.11
   legacyCutoff?: number                                // default Date.UTC(2027, 0, 1)
   allowMyshopifyIo?: boolean
   report?(error, context): void
@@ -208,6 +241,9 @@ type ShopRecord = {
   attemptSince?: number                    // send time of the earliest token call whose outcome isn't stored
   failures?: { count: number; kind: 'transient' | 'shop_unavailable' | 'configuration'; code: string
                since: number; retryAt: number; ambiguousSince?: number; credFp: string; reported?: string }
+  fallback?: { token: Sealed; tokenFp: string; expires: number; scope?: string; kid: string; obtainedAt: number }   // §6.10
+  mintRejected?: { kid: string; since: number; first?: number; count?: number; retryAt?: number }                     // §6.10
+  appTokenFps?: string[]                                                                                              // §6.10
 }
 type Sealed = { kid: string; iv: Uint8Array; ct: Uint8Array }   // AAD `${shop}|${field}`
 ```
@@ -460,6 +496,125 @@ most 3 token calls started or joined:
 A success rewrites every field under the current key and drops the alternates,
 so a rollover also reseals.
 
+### 6.10 App-token fallback
+
+With `appTokenKey` set, `getSession` with `caller: 'app'` answers with an
+application-only token when the chain's answer would be `needs_reauth` (any
+reason, including after a failed credFp retry) or `tokenless(token_endpoint)`.
+`unreadable`, `legacy_unusable`, `import_failed` and `none` keep their answers;
+`caller: 'library'` never gets one, so `authenticate.admin` exchanges and heals
+the chain.
+
+A shop without a record never gets one: after the import and backfill, a
+missing record means uninstalled or never installed, and minting would create
+records and markers for arbitrary domains.
+
+- Serve `record.fallback`, read when serving (a 401 report may just have
+  dropped it), while `expires - now` exceeds `min(minValidity, lifetime / 2)`,
+  so a token shorter-lived than the caller asks for is still served; otherwise
+  mint. A fallback minted under another
+  signing `kid` (possibly revoked) or sealed under a dropped key counts as
+  absent.
+- Mint in its own single flight (`minting`), not `inflight`: it presents no
+  refresh token, so rotation rules don't order it, and chain callers, the
+  alarm and rollovers never join it. §6.1 steps 1 and 6 only: no
+  `attemptSince`, no alarm, nothing about the chain changes. The mint carries
+  the `version` the chain answered under and is discarded if it moved (before
+  or after the call); every caller waiting on it, joined or not, then asks the
+  chain again, and mints once more if the new answer still calls for it (at
+  most two mints per request). The starter is answered from the mint itself.
+  One `CALLER_WAIT` budget, started by a request's first wait for a token
+  call, covers every wait in it; a mint the budget doesn't cover still
+  finishes for the next caller.
+- Store `{ ...record, fallback }` without bumping `version`, and add its
+  fingerprint to `appTokenFps` (newest 48), which chain replacements carry
+  over. Every write that
+  replaces the chain's tokens builds a new record and so drops it; quarantine
+  and failures keep it. `reportUnauthorized` with its `tokenFp`, and an
+  issued write-back of it without a token (the library's 401 handling), drop
+  it and hold minting for a minute; an issued write-back with a token, or an
+  untagged copy of any token in `appTokenFps`, is a duplicate and is never
+  stored as the chain. Destroy and the quarantine GC delete it.
+  `expires` dates from the send (Shopify may return the token issued earlier
+  that minute).
+- Assertions are signed per attempt with `iat` 5 s back for clock skew.
+  Classification by status only: `5xx`, `429`, `408`, network, timeout,
+  challenge → transient; `402`, `404`, `423` → shop unavailable; other `4xx` → terminal
+  (a bad assertion, a revoked key and an uninstalled shop look alike); redirect,
+  bad shop, a signing failure → configuration.
+- Failures answer as the chain would. Transient and shop unavailable hold
+  minting in memory for `max(1 min, Retry-After)`, reported once per
+  `kind:code` change and logged otherwise; so is a mint that never left (a
+  key that can't sign, a bad shop). Terminal and configuration answers from
+  Shopify store `mintRejected` and are reported (only logged if the chain
+  changed meanwhile, discarding it): no mint under that `kid` before
+  `retryAt`, 10 min after the first rejection and 4× longer for each repeat,
+  up to a day, unless the chain is replaced (which drops the field) or a
+  deploy changes the `kid`. A record without `retryAt` holds a day.
+- A malformed `appTokenKey`, or one whose callback throws, turns the fallback
+  off and is reported at most hourly per isolate; it never fails the chain's
+  calls.
+- `describe` shows `fallback: { kid, expires }` and `mintRejected`; the
+  sealing key is in `kids`.
+
+The private key alone gets tokens for every installed store; the chain has no
+equivalent. It is opt-in, a Worker secret, and revoked in the Dev Dashboard on
+a leak.
+
+### 6.11 App-token primary mode
+
+With `appTokenKey` and `appTokenMode: 'primary'`, the Durable Object is an
+ephemeral application-only token cache rather than a refresh-token vault.
+`client_credentials` + JWT `client_assertion` replaces offline `refresh_token`
+swaps for every offline `loadSession` / `loadOfflineSession` (both callers).
+The client secret is optional in this mode (still useful for HMAC webhooks or
+online token exchange in the app).
+
+- Cache fields on the record: `source: 'app_token'`, sealed `token`, `expires`,
+  `renewAfter` (expires minus a uniform 180–480 s jitter, but never before half
+  the token's life), `signingKid`.
+- As in §6.10, a shop without a record is never minted for (the lazy legacy
+  import runs first when `legacyKv` is set): `none`, or `tokenless
+  (import_failed)` when that import throws. A rejection is stored on the
+  existing record only, never as a new one. An exchange (OAuth, or
+  `authenticate.admin` after `loadSession` found no token) keeps it, with
+  `retryAt` cut to 10 min after the rejection, so a fixed cause heals without
+  one refused mint per admin request. While held, a still-valid cached token
+  is served. A shop rejected (or left quarantined by chain mode) for 90 days
+  is wiped by its alarm, as in §6.5; in fallback mode, so is an app-token
+  cache primary mode left behind, which is never served to the library.
+- Serve while `now < renewAfter`, the token covers `minValidityMs` (one whose
+  whole life is shorter counts for its first half), the ciphertext opens, and
+  (when `strictSigningKid`) `signingKid` matches the configured key. Otherwise
+  mint. A ciphertext sealed under an older keyring entry is re-sealed under
+  the current key after a serve, under `waitUntil` (lazy re-encryption).
+- Mint in the existing `minting` single flight; joiners get its outcome. Up to
+  3 retries on 5xx / network / timeout with backoff 200 ms, 500 ms, 1200 ms and
+  a fresh assertion (`jti`) each attempt; no retry on 4xx (429 and 408
+  included), a challenge or a `Retry-After`. If a remint fails while
+  `now < expires - 5 s`, serve the still-valid cache. The mint captures
+  `version` first and stores nothing if it moved or the record is gone, so a
+  destroy during a mint is not undone. The marker is re-put on the first cache
+  after an install or legacy row only, not on every remint.
+- A legacy refresh-token row (no `signingKid` / not `source: 'app_token'`) is
+  ignored on load and overwritten by the mint — no migration script.
+- `putSession` of an OAuth exchange only marks the shop installed (drops any
+  refresh-token material); the next load mints. An issued 401 write-back of the
+  cached token sets `renewAfter = 0` and `tokenInvalid`; one of an older app
+  token in `appTokenFps`, tagged or not, is `merged` and changes nothing.
+- `invalidateAndRefresh({ shop, failedAccessToken? })`: if the token's
+  fingerprint still matches the cache (or no token was given), set
+  `renewAfter = 0` and mint, under the same holds as `getSession` (the stored
+  rejection, the transient backoff): `failed` with the failure's own `kind`
+  and `code` otherwise, and `failed` / `terminal` / `not_installed` without a
+  record. Wrap Admin GraphQL: on HTTP 401, call once and replay.
+- `rollover` remints a cache obtained before `obtainedBefore`, sealed under an
+  older keyring entry or signed with another key (`rolled`, `source:
+  'app_token'`); `current` otherwise. A rejection answers `rejected`, then
+  `needs_reauth` while it is held.
+- Alarms do not refresh primary caches. `describe` reports `renewAfter` and
+  `signingKid`.
+
 ## 7. Fleet jobs
 
 ### 7.1 Backfill
@@ -514,8 +669,47 @@ Uses: staged migration (§8); planned secret rotation (deploy the new secret,
 sweep, revoke once nothing is unrolled); leaked storage or refresh tokens (two
 passes: Shopify keeps a presented refresh token usable until its replacement
 is presented, so the second pass retires the leaked ones); keyring rotation
-(one pass reseals); after an emergency revoke (works only if old refresh
-tokens survive the revoke, §2).
+(one pass reseals); after an emergency revoke (old refresh tokens survive the
+revoke, §2, so a pass brings every live shop back).
+
+### 7.3 Rotation workflow
+
+`createRotateSecretsWorkflow({ registry, namespace, legacyKv?, locationHint?,
+allowMyshopifyIo?, report? })` returns a `WorkflowEntrypoint` class; the flows
+are `runRotation(params, step, deps)` in `src/rotation.ts`, with `step` and
+`fatal` (`NonRetryableError`) injected. Params: `{ kind: 'keyring' |
+'api-secret', canaryShop, stages? }`. Full design: `spec.secret-rotation.md`.
+
+- Operators put secrets; the Workflow holds none, and no step output or event
+  carries one. Each deploy is checked against a `before` snapshot of the
+  canary's `describe().keyring.kids` / `credentials.credFp`: unchanged retries
+  (propagation) then fails; any other unexpected shape fails at once.
+- Lock `shop-sessions:rotation:<kind>:lock` in the registry KV (the instance
+  id): one rotation per kind. A failed instance keeps it.
+- Passes call `rolloverShops` directly, one bounded run per step, under
+  `shop-sessions:rotation:<kind>:request` / `:state`, never the cron's keys.
+  `running` → next run; `throttled` → sleep 5 min; `halted` → wait for
+  `resume-<label>`, rewrite the request; `idle`/`invalid_request` → fail; at
+  most 500 runs per pass.
+- Keyring: `keyring-deployed` → live kids must be `[new, ...before]` →
+  canary rolls and is sealed only under the new kid → sleep 90 days → census
+  of every registry shop (`describe`, 200 per step) for kids other than the
+  new one → roll those in `ok`/`failing` (50 per step); the rest, and any that
+  didn't answer `rolled`/`current`, are stragglers (≤ 1000 listed plus the
+  total) → keyring unchanged since → `approve-drop` → `keyring-dropped` → no
+  dropped kid live, new kid live, canary not `unreadable`.
+- API secret: stages strictly increasing positive integers (default
+  `[10, 200]`, checked before the lock), then a full pass →
+  `api-secret-deployed` → `credFp` changed → canary rolls (a configuration
+  failure is fatal) → sleep 10 min → one cutoff for every stage →
+  `approve-after-<n>` after each stage → stragglers: the final pass's
+  `unrolled` minus `none`, counted per shop (not from `outcomes`, which count
+  redone pages twice), and any `offline_*` key in `legacyKv` → if any,
+  `ack-stragglers` → `api-secret-revoked` → canary rolls and is `ok`.
+- Event waits time out after 7–30 days; a timeout fails the instance.
+- `keyringRetention` (default `90 days`) shortens the keyring wait for staging
+  rehearsals only. Both flows ran on a deployed staging Worker against a dev
+  store (`scripts/staging`, spec "Verified").
 
 ## 8. App integration
 
@@ -564,8 +758,12 @@ tokens survive the revoke, §2).
   adapter mapping and tag/stripping, backfill, rollover (each answer,
   joining a call in flight, an exchange during the call, reseal) and the
   sweep (stages, cursor, budget, breaker, configuration halt, 429, resume,
-  new passes, the final state write). The core harness fails a test
-  that makes an unscripted token call or leaves a scripted one unused.
+  new passes, the final state write), the app-token fallback (each trigger
+  and non-trigger, both callers, reuse and renewal, joins and discards,
+  clearing, backoff and the terminal hold), the assertion signer (both
+  algorithms and key forms, bad keys) and grant classification. The core
+  harness fails a test that makes an unscripted token call or leaves a
+  scripted one unused.
 - Workers: additionally, the alarm backoff across evictions with a broken
   keyring, and a record sealed under a decrypt-only (older) key.
 - Workers (`@cloudflare/vitest-plugin`, compat 2024-09-23 and current): fake
@@ -574,7 +772,9 @@ tokens survive the revoke, §2).
   migration; eviction mid-refresh; destroy during a fetch; import race; destroy
   clears the alarm at the old compat date; two rollover passes retire a
   presented refresh token; a sweep over real objects (expiring and legacy);
-  Sentry wrapper type test.
+  the fallback against a fake that verifies assertions (secret revocation,
+  renewal, a 401 report, an uninstalled shop, a revoked key); Sentry wrapper
+  type test.
 
 ## Changes after code review
 
@@ -624,3 +824,19 @@ tokens survive the revoke, §2).
    page and halted on it again. Configuration failures now halt only when they are
    half of a run of 10 or more, counted apart from rejections, so closed and
    uninstalled shops don't add up to a halt.
+
+## Changes in 0.3.0 (unreleased)
+
+1. Optional app-token fallback (§6.10): with `appTokenKey`, `loadOfflineSession`
+   answers with an application-only token, `source: 'app_token'`, while the
+   shop's chain can't produce one. The record gains `fallback`,
+   `mintRejected` and `appTokenFps`; nothing else in stored data changes, and without the option
+   behavior is unchanged.
+2. App-token primary mode (§6.11): with `appTokenMode: 'primary'`, offline
+   sessions are an ephemeral application-only token cache (`renewAfter`,
+   `signingKid`, mint retries, `invalidateAndRefresh`). The client secret is
+   optional; legacy refresh-token rows are overwritten on the next load.
+3. `describe` reports the object's live configuration: `keyring.kids` (current
+   first) and `credentials.credFp`. The optional rotation Workflow (§7.3,
+   `./workflow`) checks deploys against them.
+4. A refresh `401 invalid_grant` is terminal (§2), as `401 invalid_request` was.
